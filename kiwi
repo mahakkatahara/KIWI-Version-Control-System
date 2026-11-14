@@ -1,8 +1,32 @@
 #!/bin/bash
-# KIWI launcher script for Unix systems
+# KIWI launcher script for Unix systems (macOS / Linux)
+
+# Ensure Java is available
+if ! command -v java >/dev/null 2>&1 || ! java -version >/dev/null 2>&1; then
+    if [ -x "/usr/libexec/java_home" ]; then
+        JH="$(/usr/libexec/java_home 2>/dev/null)"
+        if [ -n "$JH" ] && [ -d "$JH" ]; then
+            export JAVA_HOME="$JH"
+            export PATH="$JAVA_HOME/bin:$PATH"
+        fi
+    fi
+    if ! command -v java >/dev/null 2>&1 || ! java -version >/dev/null 2>&1; then
+        for candidate in \
+            "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home" \
+            "/opt/homebrew/opt/openjdk" \
+            "/usr/lib/jvm/default-java"; do
+            if [ -x "$candidate/bin/java" ]; then
+                export JAVA_HOME="$candidate"
+                export PATH="$candidate/bin:$PATH"
+                break
+            fi
+        done
+    fi
+fi
 
 # Determine the directory of this script
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Run the Java program
 java -cp "$DIR" src.KIWI "$@"
+

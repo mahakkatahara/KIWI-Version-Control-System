@@ -4,10 +4,27 @@ import errors.*;
 import java.io.*;
 import java.nio.file.*;
 import java.security.NoSuchAlgorithmException;
+import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.stream.Stream;
 import utils.*;
 
 class Helper {
+
+    protected static String normalizePath(String path) {
+        try {
+            Path repoRoot = Paths.get("").toAbsolutePath().normalize();
+            Path targetPath = Paths.get(path).toAbsolutePath().normalize();
+            if (targetPath.startsWith(repoRoot)) {
+                Path rel = repoRoot.relativize(targetPath);
+                String relStr = rel.toString().replace("\\", "/").trim();
+                return relStr.isEmpty() ? "." : relStr;
+            }
+            return targetPath.toString().replace("\\", "/").trim();
+        } catch (Exception e) {
+            return path.replace("\\", "/").trim();
+        }
+    }
 
     protected static String updateIndex(String content, String filename, String hash) {
         StringBuilder sb = new StringBuilder();
@@ -31,7 +48,7 @@ class Helper {
                 sb.append(normalizedFile).append(" ").append(hash).append("\n");
                 replaced = true;
             } else {
-                sb.append(line).append("\n");
+                sb.append(existingFile).append(" ").append(parts[1].trim()).append("\n");
             }
         }
 
@@ -41,12 +58,49 @@ class Helper {
         return sb.toString();
     }
 
-    protected static String normalizePath(String path) {
-        try {
-            return new File(path).getCanonicalPath().replace("\\", "/").trim();
-        } catch (IOException e) {
-            return path.replace("\\", "/").trim();
+    protected static boolean isFileInIndex(File indexFile, String normalizedFile) throws IOException {
+        if (!indexFile.exists()) {
+            return false;
         }
+        List<String> lines = Files.readAllLines(indexFile.toPath());
+        for (String line : lines) {
+            line = line.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split(" ", 2);
+            if (parts.length < 2) {
+                continue;
+            }
+            String existing = normalizePath(parts[0]);
+            if (existing.equals(normalizedFile)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected static void removeFileFromIndex(File indexFile, String normalizedFile) throws IOException {
+        if (!indexFile.exists()) {
+            return;
+        }
+        List<String> lines = Files.readAllLines(indexFile.toPath());
+        StringBuilder sb = new StringBuilder();
+        for (String line : lines) {
+            line = line.trim();
+            if (line.isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split(" ", 2);
+            if (parts.length < 2) {
+                continue;
+            }
+            String existing = normalizePath(parts[0]);
+            if (!existing.equals(normalizedFile)) {
+                sb.append(existing).append(" ").append(parts[1].trim()).append("\n");
+            }
+        }
+        Files.writeString(indexFile.toPath(), sb.toString());
     }
 
     protected static void removeDeletedFilesFromIndex() throws IndexCorruptedException {
@@ -60,7 +114,8 @@ class Helper {
             StringBuilder updatedContent = new StringBuilder();
 
             for (String line : lines) {
-                if (line.trim().isEmpty()) {
+                line = line.trim();
+                if (line.isEmpty()) {
                     continue;
                 }
                 String[] parts = line.split(" ", 2);
@@ -72,12 +127,9 @@ class Helper {
                 String hash = parts[1].trim();
                 File f = new File(filename);
 
-                if (!f.exists()) {
-                    File objectFile = new File(".kiwi/objects/" + hash);
-                    if (objectFile.exists()) {
-                        Files.deleteIfExists(objectFile.toPath());
-                    }
-                } else {
+                // If file still exists, keep it in the index.
+                // If deleted, we remove it from stage.index without deleting objects in .kiwi/objects.
+                if (f.exists()) {
                     updatedContent.append(filename).append(" ").append(hash).append("\n");
                 }
             }
@@ -89,54 +141,60 @@ class Helper {
     }
 
     protected static void addSingleFile(String filename) throws FileStagingException, ObjectWriteException {
-        File file = new File(filename);
+        String normalizedFile = normalizePath(filename);
 
-        if (!file.exists() || file.isDirectory()) {
-            throw new FileStagingException(filename, "File does not exist or is a directory.");
+        if (normalizedFile.equals(".kiwi") || normalizedFile.startsWith(".kiwi/") || normalizedFile.startsWith(".kiwi\\")) {
+            throw new FileStagingException(filename, "Cannot stage KIWI internal directory.");
+        }
+        if (normalizedFile.equals(".git") || normalizedFile.startsWith(".git/") || normalizedFile.startsWith(".git\\")) {
+            throw new FileStagingException(filename, "Cannot stage Git repository files.");
+        }
+
+        File file = new File(filename);
+        File indexFile = new File(".kiwi/index/stage.index");
+
+        // If file does not exist on disk, check if it was staged previously (stage deletion)
+        if (!file.exists()) {
+            try {
+                if (indexFile.exists() && isFileInIndex(indexFile, normalizedFile)) {
+                    removeFileFromIndex(indexFile, normalizedFile);
+                    return;
+                }
+            } catch (IOException ignored) {
+            }
+            throw new FileStagingException(filename, "File does not exist.");
+        }
+
+        if (file.isDirectory()) {
+            throw new FileStagingException(filename, "File is a directory. Use 'kiwi add .' to stage directories.");
         }
 
         try {
             String hash = HashUtils.getFileHash(file);
-            File indexFile = new File(".kiwi/index/stage.index");
-            indexFile.createNewFile();
+
+            if (!indexFile.exists()) {
+                indexFile.getParentFile().mkdirs();
+                indexFile.createNewFile();
+            }
 
             String existingContent = "";
             if (indexFile.length() > 0) {
                 existingContent = Files.readString(indexFile.toPath());
             }
 
-            String normalizedFile = normalizePath(filename);
-            String oldHash = null;
-            for (String line : existingContent.split("\n")) {
-                String l = line.trim();
-                if (l.isEmpty()) {
-                    continue;
-                }
-                String[] parts = l.split(" ", 2);
-                if (parts.length < 2) {
-                    continue;
-                }
-                String existingFile = normalizePath(parts[0]);
-                if (existingFile.equals(normalizedFile)) {
-                    oldHash = parts[1].trim();
-                    break;
-                }
+            File objectsDir = new File(".kiwi/objects");
+            if (!objectsDir.exists()) {
+                objectsDir.mkdirs();
             }
 
-            // delete old object if file changed
-            if (oldHash != null && !oldHash.equals(hash)) {
-                File oldObjectFile = new File(".kiwi/objects/" + oldHash);
-                Files.deleteIfExists(oldObjectFile.toPath());
-            }
-
-            File objectFile = new File(".kiwi/objects/" + hash);
+            File objectFile = new File(objectsDir, hash);
             try {
                 Files.copy(file.toPath(), objectFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException e) {
                 throw new ObjectWriteException(hash, e.getMessage());
             }
 
-            String updatedContent = updateIndex(existingContent, filename, hash);
+            String updatedContent = updateIndex(existingContent, normalizedFile, hash);
             Files.writeString(indexFile.toPath(), updatedContent);
 
         } catch (IOException | NoSuchAlgorithmException e) {
@@ -149,6 +207,8 @@ class Helper {
         if (files == null) {
             return;
         }
+
+        Arrays.sort(files, Comparator.comparing(File::getName));
 
         for (File file : files) {
             String name = file.getName();
@@ -165,16 +225,46 @@ class Helper {
     }
 
     protected static String formatTimestamp(long millis) {
-        java.text.SimpleDateFormat sdf
-                = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-        sdf.setTimeZone(java.util.TimeZone.getDefault()); // your local timezone
-        return sdf.format(new java.util.Date(millis));
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        sdf.setTimeZone(TimeZone.getDefault());
+        return sdf.format(new Date(millis));
+    }
+
+    protected static long getCommitTimestamp(File folder) {
+        String name = folder.getName().trim();
+        String dateStr = "";
+        File messageFile = new File(folder, "message.txt");
+
+        if (messageFile.exists()) {
+            String[] parts = name.split(" ", 2);
+            if (parts.length >= 2) {
+                dateStr = parts[1].trim();
+            }
+        } else {
+            // Older commit backward compatibility: date is in folder name
+            if (name.length() >= 19) {
+                dateStr = name.substring(name.length() - 19).trim();
+            }
+        }
+
+        if (!dateStr.isEmpty()) {
+            try {
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                return sdf.parse(dateStr).getTime();
+            } catch (Exception ignored) {
+            }
+        }
+        return folder.lastModified();
     }
 
     protected static String addContent(File folder) throws IOException {
         StringBuilder sb = new StringBuilder();
         File[] files = folder.listFiles();
-        if (files == null) return "";
+        if (files == null) {
+            return "";
+        }
+
+        Arrays.sort(files, Comparator.comparing(File::getName));
 
         for (File file : files) {
             if (file.isDirectory()) {
@@ -190,48 +280,50 @@ class Helper {
         Path source = src.toPath();
         Path target = dest.toPath();
 
-        Files.walk(source).forEach(path -> {
-            try {
-                Path relative = source.relativize(path);
-                Path destination = target.resolve(relative);
+        try (Stream<Path> stream = Files.walk(source)) {
+            stream.forEach(path -> {
+                try {
+                    Path relative = source.relativize(path);
+                    Path destination = target.resolve(relative);
 
-                if (Files.isDirectory(path)) {
-                    Files.createDirectories(destination);
-                } else {
-                    Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
+                    if (Files.isDirectory(path)) {
+                        Files.createDirectories(destination);
+                    } else {
+                        Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
                 }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        });
+            });
+        }
     }
-
-
 }
 
 class VCSHANDLER extends Helper {
 
-    public static void initRepository() throws RepoAlreadyExistsException, CommitException {
+    public static void initRepository() throws RepoAlreadyExistsException, KiwiException {
         File kiwiDir = new File(".kiwi");
 
+        if (kiwiDir.exists()) {
+            throw new RepoAlreadyExistsException("Repository already initialized in this directory!");
+        }
+
         try {
-            if (kiwiDir.exists()) {
-                throw new RepoAlreadyExistsException("Repository already initialized in this directory!");
-            }
             if (!kiwiDir.mkdir()) {
-                throw new CommitException("Failed to create .kiwi directory!");
+                throw new KiwiException("Failed to create .kiwi directory!");
             }
 
             new File(".kiwi/objects").mkdirs();
             new File(".kiwi/commits").mkdirs();
             new File(".kiwi/index").mkdirs();
 
+            new File(".kiwi/index/stage.index").createNewFile();
             new File(".kiwi/HEAD").createNewFile();
 
             System.out.println(Colors.GREEN + "Initialized KIWI repository" + Colors.RESET);
 
         } catch (IOException e) {
-            throw new CommitException("Could not initialize repository: " + e.getMessage());
+            throw new KiwiException("Could not initialize repository: " + e.getMessage());
         }
     }
 
@@ -242,14 +334,13 @@ class VCSHANDLER extends Helper {
             throw new RepoNotInitializedException();
         }
 
-        removeDeletedFilesFromIndex();
-
         if (args.length < 2) {
             System.out.println(Colors.YELLOW + "Usage: kiwi add <filename> [more_files] OR kiwi add ." + Colors.RESET);
             return;
         }
 
         if (args[1].equals(".")) {
+            removeDeletedFilesFromIndex();
             addAllFilesRecursively(new File("."));
             System.out.println(Colors.GREEN + "Staging completed." + Colors.RESET);
             return;
@@ -268,11 +359,14 @@ class VCSHANDLER extends Helper {
             return;
         }
 
+        Arrays.sort(files, Comparator.comparing(File::getName));
+
         for (File file : files) {
             String name = file.getName();
             if (name.equals(".kiwi") || name.startsWith(".")) {
                 continue;
             }
+
             if (file.isDirectory()) {
                 status(file, indexMap, deletedfiles, modified, untracked);
             } else {
@@ -283,10 +377,10 @@ class VCSHANDLER extends Helper {
                     if (indexMap.containsKey(normalizedPath)) {
                         String storedHash = indexMap.get(normalizedPath);
                         if (!storedHash.equals(hash)) {
-                            modified.add(file.getName());
+                            modified.add(normalizedPath);
                         }
                     } else {
-                        untracked.add(file.getName());
+                        untracked.add(normalizedPath);
                     }
 
                 } catch (IOException | NoSuchAlgorithmException e) {
@@ -302,29 +396,27 @@ class VCSHANDLER extends Helper {
         }
 
         File indexFile = new File(".kiwi/index/stage.index");
-        if (!indexFile.exists()) {
-            System.out.println(Colors.RED + "No files have been staged yet!" + Colors.RESET);
-            return;
-        }
-
         Map<String, String> indexMap = new HashMap<>();
-        try {
-            List<String> lines = Files.readAllLines(indexFile.toPath());
-            for (String line : lines) {
-                line = line.trim();
-                if (line.isEmpty()) {
-                    continue;
+
+        if (indexFile.exists()) {
+            try {
+                List<String> lines = Files.readAllLines(indexFile.toPath());
+                for (String line : lines) {
+                    line = line.trim();
+                    if (line.isEmpty()) {
+                        continue;
+                    }
+                    String[] parts = line.split(" ", 2);
+                    if (parts.length < 2) {
+                        continue;
+                    }
+                    String filename = normalizePath(parts[0]);
+                    String hash = parts[1].trim();
+                    indexMap.put(filename, hash);
                 }
-                String[] parts = line.split(" ", 2);
-                if (parts.length < 2) {
-                    continue;
-                }
-                String filename = normalizePath(parts[0]);
-                String hash = parts[1].trim();
-                indexMap.put(filename, hash);
+            } catch (IOException e) {
+                throw new IndexCorruptedException(e.getMessage());
             }
-        } catch (IOException e) {
-            throw new IndexCorruptedException(e.getMessage());
         }
 
         ArrayList<String> modified = new ArrayList<>();
@@ -334,16 +426,21 @@ class VCSHANDLER extends Helper {
         for (String filename : indexMap.keySet()) {
             File f = new File(filename);
             if (!f.exists()) {
-                deletedfiles.add(f.getName());
+                deletedfiles.add(filename);
             }
         }
 
         status(new File("."), indexMap, deletedfiles, modified, untracked);
 
+        if (indexMap.isEmpty() && untracked.isEmpty() && modified.isEmpty() && deletedfiles.isEmpty()) {
+            System.out.println(Colors.RED + "No files have been staged yet!" + Colors.RESET);
+            return;
+        }
+
         System.out.println();
         System.out.println(Colors.CYAN + "======================================" + Colors.RESET);
 
-        if (modified.isEmpty() && untracked.isEmpty()) {
+        if (modified.isEmpty() && untracked.isEmpty() && deletedfiles.isEmpty()) {
             System.out.println(Colors.GREEN + "ALL GOOD" + Colors.RESET);
         }
 
@@ -371,50 +468,88 @@ class VCSHANDLER extends Helper {
         System.out.println(Colors.CYAN + "======================================" + Colors.RESET);
     }
 
-    
     public static void commit(String[] args)
             throws RepoNotInitializedException, CommitException {
 
+        if (!new File(".kiwi").exists()) {
+            throw new RepoNotInitializedException();
+        }
+
+        if (args.length < 2) {
+            throw new CommitException("Commit message not provided! Usage: kiwi commit <message>");
+        }
+
+        String message = String.join(" ", Arrays.copyOfRange(args, 1, args.length)).trim();
+        if (message.isEmpty()) {
+            throw new CommitException("Commit message cannot be empty!");
+        }
+
+        File indexFile = new File(".kiwi/index/stage.index");
+        if (!indexFile.exists() || indexFile.length() == 0) {
+            throw new CommitException("No files staged for commit. Use 'kiwi add <file>' first.");
+        }
+
         try {
-            if (!new File(".kiwi").exists()) {
-                throw new RepoNotInitializedException();
-                }
-            
-                if (args.length < 2) {
-                    System.out.println(Colors.YELLOW + ("Commit message not provided!") + Colors.RESET);
-                    return;
-                }
-
-                long timestampMillis = System.currentTimeMillis();
-                String Readable_time = formatTimestamp(timestampMillis);
-
-                String message = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
-
-
-                String content = addContent(new File(".kiwi/objects"));
-                String commitHash = CommitHashUtils.generateCommitHash(content);
-                String CommitName = commitHash + " " + message + " " + Readable_time;
-                
-                File commitDir = new File(".kiwi/commits"+"/"+CommitName);
-                commitDir.mkdirs();
-
-                File commitObjectsDir = new File(".kiwi/commits/"+CommitName+"/objects");
-                File commitIndexDir = new File(".kiwi/commits/"+CommitName+"/index");
-
-                commitObjectsDir.mkdirs();
-                commitIndexDir.mkdirs();
-
-                copyFolder(new File(".kiwi/objects"), commitObjectsDir);
-                copyFolder(new File(".kiwi/index"), commitIndexDir);
-
+            String currentIndexContent = Files.readString(indexFile.toPath()).trim();
+            if (currentIndexContent.isEmpty()) {
+                throw new CommitException("No files staged for commit. Use 'kiwi add <file>' first.");
             }
-            catch(Exception e)
-        {
-            throw new CommitException(e.getMessage()); 
+
+            // Check against the latest commit to prevent empty commits when nothing has changed
+            File commitsDir = new File(".kiwi/commits");
+            File[] commitFolders = commitsDir.listFiles(File::isDirectory);
+            if (commitFolders != null && commitFolders.length > 0) {
+                Arrays.sort(commitFolders, (f1, f2) -> Long.compare(getCommitTimestamp(f2), getCommitTimestamp(f1)));
+                File latestCommit = commitFolders[0];
+                File latestIndexFile = new File(latestCommit, "index/stage.index");
+                if (latestIndexFile.exists()) {
+                    String latestIndexContent = Files.readString(latestIndexFile.toPath()).trim();
+                    if (currentIndexContent.equals(latestIndexContent)) {
+                        throw new CommitException("No changes staged for commit. Stage new or modified files first.");
+                    }
+                }
+            }
+
+            long timestampMillis = System.currentTimeMillis();
+            String readableTime = formatTimestamp(timestampMillis);
+
+            String content = addContent(new File(".kiwi/objects"));
+            String dataToHash = content + "\n" + readableTime + "\n" + message;
+            String commitHash = CommitHashUtils.generateCommitHash(dataToHash);
+            String commitName = commitHash + " " + readableTime;
+
+            File commitDir = new File(".kiwi/commits/" + commitName);
+            commitDir.mkdirs();
+
+            File commitObjectsDir = new File(commitDir, "objects");
+            File commitIndexDir = new File(commitDir, "index");
+
+            commitObjectsDir.mkdirs();
+            commitIndexDir.mkdirs();
+
+            copyFolder(new File(".kiwi/objects"), commitObjectsDir);
+            copyFolder(new File(".kiwi/index"), commitIndexDir);
+
+            File messageFile = new File(commitDir, "message.txt");
+            Files.writeString(messageFile.toPath(), message);
+
+            File headFile = new File(".kiwi/HEAD");
+            Files.writeString(headFile.toPath(), commitHash);
+
+            System.out.println(Colors.GREEN + "[" + commitHash.substring(0, 7) + "] " + message + Colors.RESET);
+
+        } catch (KiwiException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new CommitException(e.getMessage());
         }
+    }
+
+    public static void log() throws RepoNotInitializedException {
+        if (!new File(".kiwi").exists()) {
+            throw new RepoNotInitializedException();
         }
 
-    public static void log() {
         try {
             File commitsDir = new File(".kiwi/commits");
 
@@ -423,22 +558,60 @@ class VCSHANDLER extends Helper {
                 System.out.println(Colors.YELLOW + "No commits yet!" + Colors.RESET);
                 return;
             }
-            Arrays.sort(commitFolders, Comparator.comparing(File::getName).reversed());
+
+            // Chronological sort: newest first
+            Arrays.sort(commitFolders, (f1, f2) -> {
+                int cmp = Long.compare(getCommitTimestamp(f2), getCommitTimestamp(f1));
+                if (cmp != 0) {
+                    return cmp;
+                }
+                return f2.getName().compareTo(f1.getName());
+            });
 
             System.out.println(Colors.CYAN + "\n ============ KIWI COMMIT HISTORY ============" + Colors.RESET);
 
             for (File folder : commitFolders) {
 
                 String name = folder.getName().trim();
+                String hash = "";
+                String message = "";
+                String date = "";
 
-                String[] parts = name.split(" ", 3);
-                if (parts.length < 3) {
-                    continue;
+                File messageFile = new File(folder, "message.txt");
+                if (messageFile.exists()) {
+                    String[] parts = name.split(" ", 2);
+                    if (parts.length < 2) {
+                        continue;
+                    }
+                    hash = parts[0].trim();
+                    date = parts[1].trim();
+                    try {
+                        message = Files.readString(messageFile.toPath()).trim();
+                    } catch (IOException e) {
+                        message = "";
+                    }
+                } else {
+                    // Backward compatibility: older commits that still store message in folder name
+                    int firstSpace = name.indexOf(' ');
+                    if (firstSpace == -1) {
+                        continue;
+                    }
+                    hash = name.substring(0, firstSpace).trim();
+                    String rest = name.substring(firstSpace + 1).trim();
+
+                    if (rest.length() > 20 && rest.charAt(rest.length() - 20) == ' ') {
+                        message = rest.substring(0, rest.length() - 20).trim();
+                        date = rest.substring(rest.length() - 19).trim();
+                    } else {
+                        String[] parts = name.split(" ", 3);
+                        if (parts.length < 3) {
+                            continue;
+                        }
+                        hash = parts[0].trim();
+                        message = parts[1].trim();
+                        date = parts[2].trim();
+                    }
                 }
-
-                String hash = parts[0].trim();
-                String message = parts[1].trim();
-                String date = parts[2].trim();
 
                 System.out.println("Hash:     " + Colors.CYAN + hash + Colors.RESET);
                 System.out.println("Timestamp:    " + Colors.MAGENTA + date + Colors.RESET);
@@ -451,13 +624,163 @@ class VCSHANDLER extends Helper {
         }
     }
 }
+
 public class KIWI {
+    private static void handleAddFile(VCSHANDLER vcs, Scanner scanner) throws KiwiException {
+        System.out.print("Enter filename: ");
+        if (!scanner.hasNextLine()) {
+            return;
+        }
+        String filename = scanner.nextLine().trim();
+
+        if (filename.isEmpty()) {
+            System.out.println(Colors.RED + "Filename cannot be empty!" + Colors.RESET);
+            return;
+        }
+
+        Path repoRoot = Paths.get("").toAbsolutePath().normalize();
+        Path filePath;
+        try {
+            filePath = repoRoot.resolve(filename).normalize();
+        } catch (InvalidPathException e) {
+            System.out.println(Colors.RED + "Invalid filename or path: " + e.getMessage() + Colors.RESET);
+            return;
+        }
+
+        if (!filePath.startsWith(repoRoot) || filePath.equals(repoRoot)) {
+            System.out.println(Colors.RED + "Invalid path: Directory traversal outside repository is not allowed." + Colors.RESET);
+            return;
+        }
+
+        String relPath = repoRoot.relativize(filePath).toString().replace("\\", "/");
+        if (relPath.equals(".kiwi") || relPath.startsWith(".kiwi/") ||
+            relPath.equals(".git") || relPath.startsWith(".git/")) {
+            System.out.println(Colors.RED + "Cannot modify internal repository files or directories." + Colors.RESET);
+            return;
+        }
+
+        if (!new File(".kiwi").exists()) {
+            throw new RepoNotInitializedException();
+        }
+
+        File targetFile = filePath.toFile();
+
+        if (targetFile.exists()) {
+            if (targetFile.isDirectory()) {
+                System.out.println(Colors.RED + "Path is a directory, not a file. Use Option 3 ('Add All Files') or 'kiwi add .' to stage directories." + Colors.RESET);
+                return;
+            }
+
+            System.out.print("File already exists. Do you want to stage it directly? (Y/N): ");
+            if (!scanner.hasNextLine()) {
+                return;
+            }
+            String answer = scanner.nextLine().trim();
+            if (answer.equalsIgnoreCase("y") || answer.equalsIgnoreCase("yes")) {
+                vcs.add(new String[]{"add", relPath});
+            }
+        } else {
+            System.out.print("File does not exist. Do you want to create it? (Y/N): ");
+            if (!scanner.hasNextLine()) {
+                return;
+            }
+            String answer = scanner.nextLine().trim();
+            if (answer.equalsIgnoreCase("y") || answer.equalsIgnoreCase("yes")) {
+                try {
+                    File parentDir = targetFile.getParentFile();
+                    if (parentDir != null && !parentDir.exists()) {
+                        if (!parentDir.mkdirs()) {
+                            System.err.println(Colors.RED + "Failed to create directory: " + parentDir.getPath() + Colors.RESET);
+                            return;
+                        }
+                    }
+
+                    boolean created = targetFile.createNewFile();
+                    if (!created && !targetFile.exists()) {
+                        System.err.println(Colors.RED + "Failed to create file: " + relPath + Colors.RESET);
+                        return;
+                    }
+
+                    System.out.print("Enter file content: ");
+                    if (!scanner.hasNextLine()) {
+                        return;
+                    }
+                    String content = scanner.nextLine();
+
+                    Files.writeString(filePath, content);
+                    System.out.println(Colors.GREEN + "File '" + relPath + "' created successfully." + Colors.RESET);
+
+                    vcs.add(new String[]{"add", relPath});
+                    System.out.println(Colors.GREEN + "File '" + relPath + "' staged successfully." + Colors.RESET);
+                } catch (IOException e) {
+                    System.err.println(Colors.RED + "File creation error: " + e.getMessage() + Colors.RESET);
+                } catch (SecurityException e) {
+                    System.err.println(Colors.RED + "Permission denied: " + e.getMessage() + Colors.RESET);
+                }
+            }
+        }
+    }
+
+    public static void runInteractiveMenu(VCSHANDLER vcs) {
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            System.out.println("KIWI \u2013 VERSION CONTROL SYSTEM");
+            System.out.println();
+            System.out.println("1. Initialize Repository");
+            System.out.println("2. Add a File");
+            System.out.println("3. Add All Files");
+            System.out.println("4. Check Status");
+            System.out.println("5. Commit Changes");
+            System.out.println("6. View Commit History");
+            System.out.println("7. Exit");
+            System.out.println();
+            System.out.print("Enter your choice: ");
+
+            if (!scanner.hasNextLine()) {
+                break;
+            }
+            String choice = scanner.nextLine().trim();
+
+            if (choice.equals("7")) {
+                System.out.println("Exiting KIWI. Goodbye!");
+                break;
+            }
+
+            try {
+                switch (choice) {
+                    case "1" -> vcs.initRepository();
+                    case "2" -> handleAddFile(vcs, scanner);
+                    case "3" -> vcs.add(new String[]{"add", "."});
+                    case "4" -> vcs.status();
+                    case "5" -> {
+                        System.out.print("Enter commit message: ");
+                        if (!scanner.hasNextLine()) {
+                            return;
+                        }
+                        String message = scanner.nextLine().trim();
+                        vcs.commit(new String[]{"commit", message});
+                    }
+                    case "6" -> vcs.log();
+                    default -> System.out.println(Colors.RED + "Invalid choice. Please enter a number between 1 and 7." + Colors.RESET);
+                }
+            } catch (KiwiException e) {
+                System.err.println(Colors.RED + "[KIWI ERROR] " + e.getMessage() + Colors.RESET);
+            } catch (Exception e) {
+                System.err.println(Colors.RED + "[SYSTEM ERROR] " + e.getMessage() + Colors.RESET);
+            }
+
+            System.out.println();
+        }
+    }
+
     public static void main(String[] args) {
         VCSHANDLER vcs = new VCSHANDLER();
+        if (args.length == 0) {
+            runInteractiveMenu(vcs);
+            return;
+        }
+
         try {
-            if (args.length == 0) {
-                throw new InvalidCommandException("No command provided. Try 'kiwi init', 'kiwi add', or 'kiwi commit'.");
-            }
             String command = args[0];
 
             switch (command) {
