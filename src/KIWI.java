@@ -393,19 +393,22 @@ class VCSHANDLER extends Helper {
 
                 String content = addContent(new File(".kiwi/objects"));
                 String commitHash = CommitHashUtils.generateCommitHash(content);
-                String CommitName = commitHash + " " + message + " " + Readable_time;
+                String CommitName = commitHash + " " + Readable_time;
                 
-                File commitDir = new File(".kiwi/commits"+"/"+CommitName);
+                File commitDir = new File(".kiwi/commits" + "/" + CommitName);
                 commitDir.mkdirs();
 
-                File commitObjectsDir = new File(".kiwi/commits/"+CommitName+"/objects");
-                File commitIndexDir = new File(".kiwi/commits/"+CommitName+"/index");
+                File commitObjectsDir = new File(".kiwi/commits/" + CommitName + "/objects");
+                File commitIndexDir = new File(".kiwi/commits/" + CommitName + "/index");
 
                 commitObjectsDir.mkdirs();
                 commitIndexDir.mkdirs();
 
                 copyFolder(new File(".kiwi/objects"), commitObjectsDir);
                 copyFolder(new File(".kiwi/index"), commitIndexDir);
+
+                File messageFile = new File(commitDir, "message.txt");
+                Files.writeString(messageFile.toPath(), message);
 
             }
             catch(Exception e)
@@ -430,15 +433,45 @@ class VCSHANDLER extends Helper {
             for (File folder : commitFolders) {
 
                 String name = folder.getName().trim();
+                String hash = "";
+                String message = "";
+                String date = "";
 
-                String[] parts = name.split(" ", 3);
-                if (parts.length < 3) {
-                    continue;
+                File messageFile = new File(folder, "message.txt");
+                if (messageFile.exists()) {
+                    String[] parts = name.split(" ", 2);
+                    if (parts.length < 2) {
+                        continue;
+                    }
+                    hash = parts[0].trim();
+                    date = parts[1].trim();
+                    try {
+                        message = Files.readString(messageFile.toPath()).trim();
+                    } catch (IOException e) {
+                        message = "";
+                    }
+                } else {
+                    // Backward compatibility: older commits that still store message in folder name
+                    int firstSpace = name.indexOf(' ');
+                    if (firstSpace == -1) {
+                        continue;
+                    }
+                    hash = name.substring(0, firstSpace).trim();
+                    String rest = name.substring(firstSpace + 1).trim();
+
+                    if (rest.length() > 20 && rest.charAt(rest.length() - 20) == ' ') {
+                        message = rest.substring(0, rest.length() - 20).trim();
+                        date = rest.substring(rest.length() - 19).trim();
+                    } else {
+                        String[] parts = name.split(" ", 3);
+                        if (parts.length < 3) {
+                            continue;
+                        }
+                        hash = parts[0].trim();
+                        message = parts[1].trim();
+                        date = parts[2].trim();
+                    }
                 }
-
-                String hash = parts[0].trim();
-                String message = parts[1].trim();
-                String date = parts[2].trim();
 
                 System.out.println("Hash:     " + Colors.CYAN + hash + Colors.RESET);
                 System.out.println("Timestamp:    " + Colors.MAGENTA + date + Colors.RESET);
